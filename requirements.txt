@@ -1,0 +1,9 @@
+async-timeout==5.0.1
+bleak==2.1.1
+numpy==2.2.6
+packaging @ file:///opt/miniconda3/conda-bld/packaging_1761049079158/work
+pyobjc-core==12.1
+pyobjc-framework-Cocoa==12.1
+pyobjc-framework-CoreBluetooth==12.1
+pyobjc-framework-libdispatch==12.1
+typing_extensions==4.15.0
