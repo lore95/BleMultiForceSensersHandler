@@ -1,5 +1,3 @@
-# Controllers/sensorcontroller.py
-
 import asyncio
 import time
 import os
@@ -69,7 +67,8 @@ class AsyncSensorReader:
         self.collected_raw_data = []    # list[(host_time_s, raw_v3)]
         self.collected_force_data = []  # list[(host_time_s, force_n)]
         self.start_time_host_s = 0.0
-
+        self.disconnect_error = False  # True only for unexpected disconnects
+        self.state_change_cb = None
         self.calibrator = V3ForceCalibrator(
             calibration_csv,
             method="piecewise",
@@ -113,7 +112,7 @@ class AsyncSensorReader:
     # -------------------- Disconnect handling --------------------
     def _on_disconnect(self, _client: BleakClient):
         print("[SENSOR] ⚠️ Device disconnected unexpectedly.")
-
+        self.disconnect_error = True
         try:
             asyncio.run_coroutine_threadsafe(
                 self._handle_disconnect(),
@@ -122,6 +121,8 @@ class AsyncSensorReader:
         except Exception as e:
             print(f"[SENSOR] Failed to schedule disconnect handler: {e}")
             self.is_connected = False
+            if hasattr(self, "state_change_cb") and self.state_change_cb:
+                self.state_change_cb()
             self.is_reading = False
 
     async def _handle_disconnect(self):
@@ -158,11 +159,16 @@ class AsyncSensorReader:
                 if save:
                     print("[SENSOR] User chose to save partial data.")
                     meta = dict(self._pending_meta)
+                    athlete_id = meta.get("turf_id", "DISCONNECT")
+                    distance_cm = float(meta.get("distance_cm", 0.0))
+                    weight_kg = int(meta.get("weight_kg", 0))
                     await asyncio.to_thread(
                         self._save_data,
                         self.collected_raw_data,
                         self.collected_force_data,
-                        meta.get("turf_id", "DISCONNECT"),
+                        athlete_id,
+                        distance_cm,
+                        weight_kg,
                     )
                     self._clear_buffers()
                 else:

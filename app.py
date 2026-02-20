@@ -1,7 +1,9 @@
-# app.py
 import os
 import tkinter as tk
 from tkinter import ttk, messagebox
+import queue
+import concurrent.futures
+import asyncio
 
 from Controller.ble_controller import BLELoopThread, BLEManager
 
@@ -15,7 +17,7 @@ class App(tk.Tk):
         # BLE loop in background thread
         self.ble_thread = BLELoopThread()
         self.ble_manager = BLEManager(self.ble_thread.loop)
-
+        self.ble_manager.on_state_change = lambda: self.after(0, self._render_list)
         # UI state
         self.devices = []           # list of (address, name) from last scan
         self.addr_to_name = {}      # address -> name
@@ -25,7 +27,7 @@ class App(tk.Tk):
         self.last_saved_file = None
 
         self._build_ui()
-
+        
         # Initial scan
         self.refresh_devices()
 
@@ -131,7 +133,40 @@ class App(tk.Tk):
             "Stop.Disabled.TButton",
             foreground=[("disabled", "gray50")],
         )
+        self.ui_requests: "queue.Queue[tuple[str, str, concurrent.futures.Future]]" = queue.Queue()
 
+        def _process_ui_requests():
+            try:
+                while True:
+                    title, msg, fut = self.ui_requests.get_nowait()
+                    try:
+                        ans = messagebox.askyesno(title, msg)
+                        if not fut.done():
+                            fut.set_result(bool(ans))
+                    except Exception as e:
+                        if not fut.done():
+                            fut.set_exception(e)
+            except queue.Empty:
+                pass
+            self.after(100, _process_ui_requests)
+
+        self.after(100, _process_ui_requests)
+
+        async def prompt_save_on_disconnect(addr: str, name: str | None = None) -> bool:
+            device_label = name or addr
+            fut: concurrent.futures.Future = concurrent.futures.Future()
+            self.ui_requests.put((
+                "BLE Disconnected",
+                f"Device disconnected unexpectedly:\n\n{device_label}\n\n"
+                "Do you want to save the data collected so far?",
+                fut,
+            ))
+            return await asyncio.wrap_future(fut)
+
+        # Expose callback for BLE layer
+        self.prompt_save_on_disconnect = prompt_save_on_disconnect
+        self.ble_manager.prompt_save_cb = self.prompt_save_on_disconnect
+        
     # ---------------- UI HELPERS ----------------
     def set_status(self, text: str):
         self.status_var.set(text)
@@ -187,10 +222,17 @@ class App(tk.Tk):
         old_selection = set(self.listbox.curselection())
 
         self.listbox.delete(0, tk.END)
-        connected = set(self._get_connected_addresses())
-
+        
         for i, (addr, name) in enumerate(self.devices):
-            prefix = "🟢 " if addr in connected else "⚪ "
+            reader = self.ble_manager.readers.get(addr)
+
+            if reader and getattr(reader, "is_connected", False):
+                prefix = "🟢 "
+            elif reader and getattr(reader, "disconnect_error", False):
+                prefix = "🔴 "
+            else:
+                prefix = "⚪ "
+
             self.listbox.insert(tk.END, f"{prefix}{name}   ({addr})")
 
         for idx in old_selection:
