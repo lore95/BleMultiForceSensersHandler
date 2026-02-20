@@ -4,8 +4,11 @@ from tkinter import ttk, messagebox
 import queue
 import concurrent.futures
 import asyncio
+from tkinter import filedialog
+from Utils.plot import plot_force_over_time
 
 from Controller.ble_controller import BLELoopThread, BLEManager
+import matplotlib.pyplot as plt
 
 
 class App(tk.Tk):
@@ -105,7 +108,14 @@ class App(tk.Tk):
             style="Stop.Disabled.TButton",
         )
         self.stop_btn.pack(side="left")
-
+        
+        plot_btn = ttk.Button(
+            btns,
+            text="📈 Plot CSV",
+            command=self.plot_csv_file,
+        )
+        plot_btn.pack(anchor="center", pady=5)
+        
         # ---- Styles for Start/Stop (enabled vs disabled) ----
         style = ttk.Style(self)
 
@@ -457,6 +467,26 @@ class App(tk.Tk):
 
         self.destroy()
 
+    def plot_csv_file(self):
+        # Default to readings folder if it exists
+        initial_dir = os.path.abspath("readings")
+        if not os.path.isdir(initial_dir):
+            initial_dir = os.getcwd()
+
+        path = filedialog.askopenfilename(
+            title="Select a readings CSV to plot",
+            initialdir=initial_dir,
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return  # user canceled
+
+        try:
+            # relative_time=True is usually nicer to look at
+            plt.close("all")
+            plot_force_over_time(path, relative_time=True)
+        except Exception as e:
+            messagebox.showerror("Plot Error", str(e))
 
 if __name__ == "__main__":
     App().mainloop()
