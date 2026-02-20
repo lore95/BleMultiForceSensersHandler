@@ -226,10 +226,10 @@ class App(tk.Tk):
         for i, (addr, name) in enumerate(self.devices):
             reader = self.ble_manager.readers.get(addr)
 
-            if reader and getattr(reader, "is_connected", False):
-                prefix = "🟢 "
-            elif reader and getattr(reader, "disconnect_error", False):
+            if reader and getattr(reader, "disconnect_error", False):
                 prefix = "🔴 "
+            elif reader and getattr(reader, "is_connected", False):
+                prefix = "🟢 "
             else:
                 prefix = "⚪ "
 

@@ -28,13 +28,11 @@ class BLELoopThread:
         self.loop.call_soon_threadsafe(self.loop.stop)
 
 class BLEManager:
-   
     async def scan_force_devices(self, name_contains: str = "force", timeout: float = 6.0) -> List[Tuple[str, str]]:
         """
         Returns list of (address, name) for devices whose name contains name_contains (case-insensitive).
         """
         devices = await BleakScanner.discover(timeout=timeout)
-        self.on_state_change: Optional[Callable[[], None]] = None
         out = []
         needle = (name_contains or "").lower()
         for d in devices:
@@ -47,8 +45,7 @@ class BLEManager:
     def __init__(self, ble_loop: asyncio.AbstractEventLoop):
         self.ble_loop = ble_loop
         self.readers: Dict[str, AsyncSensorReader] = {}  # key: address
-
-        # UI callback: async (addr, name) -> bool
+        self.on_state_change: Optional[Callable[[], None]] = None
         self.prompt_save_cb: Optional[Callable[[str, Optional[str]], Awaitable[bool]]] = None
 
     async def connect(self, address: str, *, tx_uuid: str = TX_UUID_DEFAULT) -> bool:
@@ -68,10 +65,7 @@ class BLEManager:
                 prompt_save_cb=_reader_prompt,
             )
             self.readers[address] = reader
-            reader.state_change_cb = lambda: self.ble_loop.call_soon_threadsafe(self.on_state_change) if self.on_state_change else None
-
-        # IMPORTANT: give the reader a bleak disconnected_callback
-        # (we implement _make_disconnected_cb below)
+            reader.state_change_cb = lambda: (self.on_state_change() if self.on_state_change else None)
         reader.disconnected_callback = self._make_disconnected_cb(address)
 
         # connect
@@ -79,8 +73,6 @@ class BLEManager:
 
     def _make_disconnected_cb(self, addr: str):
         def _on_disconnect(_client):
-            # Called by bleak on the BLE loop thread.
-            # Don't block here; schedule an async handler.
             asyncio.create_task(self._handle_unexpected_disconnect(addr))
         return _on_disconnect
 
@@ -88,22 +80,16 @@ class BLEManager:
         reader = self.readers.get(addr)
         if not reader:
             return
-
-        # Mark state so UI shows disconnected
         try:
             reader.is_connected = False
         except Exception:
             pass
-
-        # If you only want the popup when actively reading:
         if not getattr(reader, "is_reading", False):
             return
 
         # Ask user whether to save/stop
         if not self.prompt_save_cb:
             return
-
-        # Optional device name if you have it on reader; otherwise None
         name = getattr(reader, "name", None)
 
         try:
@@ -114,17 +100,13 @@ class BLEManager:
         if not want_save:
             return
 
-        # If user wants to save, call your existing stop/save logic.
-        # Pick the method you already have (examples below).
         try:
-            # If your reader has a stop/save method:
             if hasattr(reader, "stop_reading"):
-                # You may need to pass athlete_id/distance/weight depending on your design
                 await reader.stop_reading(...)
             elif hasattr(reader, "save_collected_data"):
                 await reader.save_collected_data()
         except Exception:
-            # best effort
+            print(Exception)
             pass
 
     async def disconnect(self, address: str) -> bool:

@@ -123,7 +123,13 @@ class AsyncSensorReader:
             self.is_connected = False
             if hasattr(self, "state_change_cb") and self.state_change_cb:
                 self.state_change_cb()
-            self.is_reading = False
+        self.is_reading = False
+        self.is_connected = False
+        self.disconnect_error = True
+            
+        print("changing status with error to: " + str(self.disconnect_error))
+
+        self._notify_state_change()
 
     async def _handle_disconnect(self):
         try:
@@ -243,7 +249,8 @@ class AsyncSensorReader:
             await self.client.start_notify(self.tx_uuid, self.notification_handler)
             print("[SENSOR] ✅ Connected. Notifications activated.")
             self.is_connected = True
-
+            self.disconnect_error = False
+            self._notify_state_change()
             return True
 
         except (BleakError, BleakDBusError) as e:
@@ -273,6 +280,9 @@ class AsyncSensorReader:
             self.client = None
 
         self.is_connected = False
+        self.disconnect_error = False
+        print("changing status with error to: " + self.disconnect_error)
+        self._notify_state_change()
         print("[SENSOR] Explicitly disconnected.")
         return True
 
@@ -350,3 +360,11 @@ class AsyncSensorReader:
 
         print(f"[SAVE] Saved {len(combined)} samples to {filename}")
         return filename
+    
+    def _notify_state_change(self):
+        cb = getattr(self, "state_change_cb", None)
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
