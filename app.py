@@ -21,7 +21,7 @@ class App(tk.Tk):
         self.addr_to_name = {}      # address -> name
         self.reading_active = False
 
-        # Track last saved filename (nice for final status)
+        # Track last saved filename used in status bar at the end of saving
         self.last_saved_file = None
 
         self._build_ui()
@@ -32,7 +32,7 @@ class App(tk.Tk):
         # Proper shutdown
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ---------------- UI BUILD ----------------
+    # ---------------- UI  ----------------
     def _build_ui(self):
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
@@ -86,11 +86,51 @@ class App(tk.Tk):
         btns = ttk.Frame(bottom)
         btns.pack(side="right")
 
-        self.start_btn = ttk.Button(btns, text="🟢 Start Reading", command=self.start_reading, state="disabled")
+        self.start_btn = ttk.Button(
+            btns,
+            text="🟢 Start Reading",
+            command=self.start_reading,
+            state="disabled",
+            style="Start.Disabled.TButton",
+        )
         self.start_btn.pack(side="left", padx=(0, 8))
 
-        self.stop_btn = ttk.Button(btns, text="🔴 Stop Reading", command=self.stop_reading, state="disabled")
+        self.stop_btn = ttk.Button(
+            btns,
+            text="🔴 Stop Reading",
+            command=self.stop_reading,
+            state="disabled",
+            style="Stop.Disabled.TButton",
+        )
         self.stop_btn.pack(side="left")
+
+        # ---- Styles for Start/Stop (enabled vs disabled) ----
+        style = ttk.Style(self)
+
+        # Start button
+        style.configure("Start.Enabled.TButton")
+        style.configure("Start.Disabled.TButton")
+
+        # Stop button
+        style.configure("Stop.Enabled.TButton")
+        style.configure("Stop.Disabled.TButton")
+        # Make disabled look more disabled across themes (best effort)
+        style.map(
+            "Start.Enabled.TButton",
+            foreground=[("disabled", "gray50")],
+        )
+        style.map(
+            "Start.Disabled.TButton",
+            foreground=[("disabled", "gray50")],
+        )
+        style.map(
+            "Stop.Enabled.TButton",
+            foreground=[("disabled", "gray50")],
+        )
+        style.map(
+            "Stop.Disabled.TButton",
+            foreground=[("disabled", "gray50")],
+        )
 
     # ---------------- UI HELPERS ----------------
     def set_status(self, text: str):
@@ -125,11 +165,20 @@ class App(tk.Tk):
     def _update_action_buttons(self):
         connected = self._get_connected_addresses()
 
-        # Start enabled only when >=1 connected and not already reading
-        self.start_btn.config(state=("normal" if (len(connected) > 0 and not self.reading_active) else "disabled"))
+        start_enabled = (len(connected) > 0 and not self.reading_active)
+        stop_enabled = self.reading_active
 
-        # Stop enabled only while reading
-        self.stop_btn.config(state=("normal" if self.reading_active else "disabled"))
+        # Start
+        self.start_btn.config(
+            state=("normal" if start_enabled else "disabled"),
+            style=("Start.Enabled.TButton" if start_enabled else "Start.Disabled.TButton"),
+        )
+
+        # Stop
+        self.stop_btn.config(
+            state=("normal" if stop_enabled else "disabled"),
+            style=("Stop.Enabled.TButton" if stop_enabled else "Stop.Disabled.TButton"),
+        )
 
     def _render_list(self):
         """
@@ -251,6 +300,7 @@ class App(tk.Tk):
             f"Athlete ID: {athlete_id}, Distance: {distance_cm:g} cm, Weight: {weight_kg} kg"
         )
         self.start_btn.config(state="disabled")
+        self._update_action_buttons()
         self._start_reading_next(connected, idx=0, athlete_id=athlete_id, distance_cm=distance_cm, weight_kg=weight_kg)
 
     def _start_reading_next(self, addrs, idx: int, athlete_id: str, distance_cm: float, weight_kg: int):
@@ -296,6 +346,7 @@ class App(tk.Tk):
 
         self.set_status(f"Stopping reading on {len(connected)} device(s)...")
         self.stop_btn.config(state="disabled")
+        self._update_action_buttons()
         self._stop_reading_next(connected, idx=0, athlete_id=athlete_id, distance_cm=distance_cm, weight_kg=weight_kg)
 
     def _stop_reading_next(self, addrs, idx: int, athlete_id: str, distance_cm: float, weight_kg: int):
