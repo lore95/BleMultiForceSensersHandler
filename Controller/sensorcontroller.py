@@ -5,13 +5,12 @@ import csv
 import numpy as np
 from datetime import date
 import re
-from typing import Callable, Optional, Awaitable, Any, Dict
+from typing import Callable, Optional, Awaitable, Any, Dict, Tuple
 
 from bleak import BleakClient
 from bleak.exc import BleakError, BleakDBusError
 
 from Utils.sensorForceConverter import V3ForceCalibrator
-
 
 LINE_RE = re.compile(
     r"Time:(-?\d+),V1:(-?\d+(?:\.\d+)?),V2:(-?\d+(?:\.\d+)?),V3:(-?\d+(?:\.\d+)?),V4:(-?\d+(?:\.\d+)?)"
@@ -43,7 +42,10 @@ class AsyncSensorReader:
     BLE sensor reader with:
       - start_notify handler to collect raw + force
       - unexpected disconnect handling via Bleak disconnected_callback
-      - optional async prompt_save_cb (must be thread-safe)
+      - async prompt_save_cb(addr, name) shown ONLY on unexpected disconnect
+      - disconnect_error flag for UI red dot
+      - state_change_cb callback for UI redraw
+      - stop_reading returns saved filename (or None)
     """
 
     def __init__(
@@ -52,7 +54,7 @@ class AsyncSensorReader:
         tx_uuid: str,
         ble_loop: asyncio.AbstractEventLoop,
         *,
-        prompt_save_cb: Optional[Callable[[], Awaitable[bool]]] = None,
+        prompt_save_cb: Optional[Callable[[str, Optional[str]], Awaitable[bool]]] = None,
         calibration_csv: str = "calibrationWeight/V3_calibration.csv",
     ):
         self.ble_address = ble_address
@@ -62,48 +64,56 @@ class AsyncSensorReader:
         self.client: Optional[BleakClient] = None
         self.is_connected = False
         self.is_reading = False
-        self.offSetValue = 0.0
 
-        self.collected_raw_data = []    # list[(host_time_s, raw_v3)]
-        self.collected_force_data = []  # list[(host_time_s, force_n)]
-        self.start_time_host_s = 0.0
+        # UI flags
         self.disconnect_error = False  # True only for unexpected disconnects
-        self.state_change_cb = None
+        self.state_change_cb: Optional[Callable[[], None]] = None
+
+        # internal disconnect bookkeeping
+        self._intentional_disconnect = False
+        self._disconnect_lock = asyncio.Lock()
+
+        # baseline / conversion
+        self.offSetValue = 0.0
         self.calibrator = V3ForceCalibrator(
             calibration_csv,
             method="piecewise",
             allow_extrapolation=True,
         )
 
+        # data
+        self.collected_raw_data: list[Tuple[float, float]] = []
+        self.collected_force_data: list[Tuple[float, float]] = []
+
+        # optional UI prompt on unexpected disconnect
         self.prompt_save_cb = prompt_save_cb
-        self._disconnect_lock = asyncio.Lock()
-        # Used when disconnect happens mid-run and you want to save partial
+
+        # meta used for saving on stop or error disconnect
         self._pending_meta: Dict[str, Any] = {
+            "athlete_id": "UNKNOWN",
             "distance_cm": 0.0,
-            "speed_mps": 0.0,
             "weight_kg": 0,
-            "turf_id": "ERROR",
         }
+
+        # optional (if you ever want to show a friendly name in the popup)
+        self.name: Optional[str] = None
 
     # -------------------- Notifications --------------------
     def notification_handler(self, sender: int, data: bytearray):
-        host_time = time.time()
         if not self.is_reading:
             return
 
+        host_time = time.time()
         try:
             line = data.decode("utf-8", errors="ignore").strip()
             m = LINE_RE.match(line)
             if not m:
                 return
 
-            t_ms = int(m.group(1))
             v3_raw = float(m.group(4))
-
             self.collected_raw_data.append((host_time, v3_raw))
 
-            v3_force = self.calibrator.raw_to_force(v3_raw,self.offSetValue)
-
+            v3_force = self.calibrator.raw_to_force(v3_raw, self.offSetValue)
             self.collected_force_data.append((host_time, v3_force))
 
         except Exception as e:
@@ -111,90 +121,85 @@ class AsyncSensorReader:
 
     # -------------------- Disconnect handling --------------------
     def _on_disconnect(self, _client: BleakClient):
+        # If we triggered disconnect ourselves, do NOT treat it as an error.
+        if self._intentional_disconnect:
+            return
+
         print("[SENSOR] ⚠️ Device disconnected unexpectedly.")
         self.disconnect_error = True
-        try:
-            asyncio.run_coroutine_threadsafe(
-                self._handle_disconnect(),
-                self.ble_loop,   # ✅ USE THE STORED LOOP
-            )
-        except Exception as e:
-            print(f"[SENSOR] Failed to schedule disconnect handler: {e}")
-            self.is_connected = False
-            if hasattr(self, "state_change_cb") and self.state_change_cb:
-                self.state_change_cb()
         self.is_reading = False
         self.is_connected = False
-        self.disconnect_error = True
-            
-        print("changing status with error to: " + str(self.disconnect_error))
-
         self._notify_state_change()
 
-    async def _handle_disconnect(self):
         try:
-            async with self._disconnect_lock:
-                was_reading = self.is_reading
-
-                self.is_connected = False
-                self.is_reading = False
-                print("[SENSOR] Handling disconnect...")
-                
-                # Ask UI whether to save (defaults to True if no callback)
-                save = True
-                if self.prompt_save_cb is not None:
-                    try:
-                        save = await self.prompt_save_cb()
-                    except Exception as e:
-                        print(f"[SENSOR] prompt_save_cb failed: {e}")
-                        save = True
-
-                # Clear client reference (it may already be dead)
-                if self.client:
-                    try:
-                        await self.client.disconnect()
-                    except Exception:
-                        pass
-                    self.client = None
-
-                if not was_reading:
-                    self._clear_buffers()
-                    print("[SENSOR] buffers cleared")
-                    return
-
-                if save:
-                    print("[SENSOR] User chose to save partial data.")
-                    meta = dict(self._pending_meta)
-                    athlete_id = meta.get("turf_id", "DISCONNECT")
-                    distance_cm = float(meta.get("distance_cm", 0.0))
-                    weight_kg = int(meta.get("weight_kg", 0))
-                    await asyncio.to_thread(
-                        self._save_data,
-                        self.collected_raw_data,
-                        self.collected_force_data,
-                        athlete_id,
-                        distance_cm,
-                        weight_kg,
-                    )
-                    self._clear_buffers()
-                else:
-                    print("[SENSOR] User chose NOT to save. Clearing buffers.")
-                    self._clear_buffers()
+            asyncio.run_coroutine_threadsafe(self._handle_disconnect(), self.ble_loop)
         except Exception as e:
-            print(f"[SENSOR] _handle_disconnect crashed: {e}")
+            print(f"[SENSOR] Failed to schedule disconnect handler: {e}")
+
+    async def _handle_disconnect(self):
+        async with self._disconnect_lock:
+            was_reading = bool(self.collected_raw_data) and bool(self.collected_force_data)
+
+            # Best-effort cleanup
+            if self.client:
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                self.client = None
+
+            # Only show popup on ERROR disconnect
+            save = True
+            if self.disconnect_error and self.prompt_save_cb is not None and was_reading:
+                try:
+                    save = await self.prompt_save_cb(self.ble_address, self.name)
+                except Exception as e:
+                    print(f"[SENSOR] prompt_save_cb failed: {e}")
+                    save = True
+
+            if (not was_reading) or (not save):
+                self._clear_buffers()
+                return
+
+            meta = dict(self._pending_meta)
+            athlete_id = meta.get("athlete_id", "UNKNOWN")
+            distance_cm = float(meta.get("distance_cm", 0.0))
+            weight_kg = int(meta.get("weight_kg", 0))
+
+            try:
+                filename = await asyncio.to_thread(
+                    self._save_data,
+                    self.collected_raw_data,
+                    self.collected_force_data,
+                    athlete_id,
+                    distance_cm,
+                    weight_kg,
+                )
+                print(f"[SENSOR] Saved partial data: {filename}")
+            finally:
+                self._clear_buffers()
 
     def _clear_buffers(self):
         self.collected_raw_data.clear()
         self.collected_force_data.clear()
-        self._pending_meta = {
-            "distance_cm": 0.0,
-            "speed_mps": 0.0,
-            "weight_kg": 0,
-            "turf_id": "UNKNOWN",
-        }
+        self._pending_meta = {"athlete_id": "UNKNOWN", "distance_cm": 0.0, "weight_kg": 0}
+
+    def _notify_state_change(self):
+        cb = self.state_change_cb
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
 
     # -------------------- Connect / Disconnect --------------------
     async def connect_device(self) -> bool:
+        # reset flags for a fresh session
+        self._intentional_disconnect = False
+        self.disconnect_error = False
+        self._notify_state_change()
+
+        # close any old client
         if self.client:
             try:
                 await self.client.disconnect()
@@ -207,16 +212,19 @@ class AsyncSensorReader:
             self.client = BleakClient(
                 self.ble_address,
                 timeout=20.0,
-                disconnected_callback=self._on_disconnect,  # ✅ critical
+                disconnected_callback=self._on_disconnect,
             )
             await self.client.connect()
 
             if not self.client.is_connected:
                 print("[SENSOR] Failed to connect.")
                 self.is_connected = False
+                self._notify_state_change()
                 return False
-            baseline_samples = []
-            print("[SENSOR] Calibrating base line for force convertion ")
+
+            # Baseline offset calibration
+            baseline_samples: list[float] = []
+            print("[SENSOR] Calibrating baseline for force conversion...")
 
             def _baseline_handler(sender: int, data: bytearray):
                 try:
@@ -228,11 +236,11 @@ class AsyncSensorReader:
                     baseline_samples.append(v3_raw)
                 except Exception:
                     return
+
             await self.client.start_notify(self.tx_uuid, _baseline_handler)
             print("[SENSOR] Collecting baseline for 5 seconds...")
             await asyncio.sleep(5.0)
 
-            # Stop temporary notify
             try:
                 await self.client.stop_notify(self.tx_uuid)
             except Exception:
@@ -245,61 +253,79 @@ class AsyncSensorReader:
                 self.offSetValue = 0.0
                 print("[SENSOR] No baseline samples received. offSetValue set to 0.0")
 
-            
+            # Start real notifications
             await self.client.start_notify(self.tx_uuid, self.notification_handler)
-            print("[SENSOR] ✅ Connected. Notifications activated.")
+
             self.is_connected = True
             self.disconnect_error = False
             self._notify_state_change()
+            print("[SENSOR] ✅ Connected. Notifications activated.")
             return True
 
         except (BleakError, BleakDBusError) as e:
             print(f"[SENSOR] ❌ Connection/Discovery Error: {e}")
-            self.is_connected = False
-            self.client = None
-            return False
         except Exception as e:
             print(f"[SENSOR] ❌ Unexpected error: {e}")
-            self.is_connected = False
-            self.client = None
-            return False
-
-    async def disconnect_device(self) -> bool:
-        # Intentional disconnect: no popup
-        self.is_reading = False
-
-        if self.client:
-            try:
-                await self.client.stop_notify(self.tx_uuid)
-            except Exception:
-                pass
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
-            self.client = None
 
         self.is_connected = False
         self.disconnect_error = False
-        print("changing status with error to: " + self.disconnect_error)
+        self.client = None
         self._notify_state_change()
-        print("[SENSOR] Explicitly disconnected.")
-        return True
+        return False
+
+    async def disconnect_device(self) -> bool:
+        # Intentional disconnect: no popup, no red dot
+        self._intentional_disconnect = True
+        self.is_reading = False
+
+        try:
+            if self.client:
+                try:
+                    await self.client.stop_notify(self.tx_uuid)
+                except Exception:
+                    pass
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                self.client = None
+
+            self.is_connected = False
+            self.disconnect_error = False
+            self._notify_state_change()
+            print("[SENSOR] Explicitly disconnected.")
+            return True
+        finally:
+            # reset so future disconnects can be treated as error if they happen
+            self._intentional_disconnect = False
 
     close = disconnect_device
 
     # -------------------- Reading control --------------------
-    async def start_reading(self, athlete_id: str = "UNKNOWN", distance_cm: float = 0.0, weight_kg: int = 0, direction: int = 0) -> bool:
-        if self.client and self.client.is_connected:
-            self.collected_raw_data.clear()
-            self.collected_force_data.clear()
-            if direction == 0:
-                self.is_reading = True
-            self._pending_meta = {"turf_id": str(athlete_id or "UNKNOWN")}
-            if direction == 0:
-                print("[SENSOR] Data logging started.")
-            return True
-        return False
+    async def start_reading(
+        self,
+        athlete_id: str = "UNKNOWN",
+        distance_cm: float = 0.0,
+        weight_kg: int = 0,
+        direction: int = 0,
+    ) -> bool:
+        if not (self.client and self.client.is_connected):
+            return False
+
+        self.collected_raw_data.clear()
+        self.collected_force_data.clear()
+
+        # store meta for filename
+        self._pending_meta = {
+            "athlete_id": str(athlete_id or "UNKNOWN"),
+            "distance_cm": float(distance_cm),
+            "weight_kg": int(weight_kg),
+        }
+
+        if direction == 0:
+            self.is_reading = True
+
+        return True
 
     async def stop_reading(self, athlete_id: str = "UNKNOWN", distance_cm: float = 0.0, weight_kg: int = 0):
         self.is_reading = False
@@ -313,9 +339,9 @@ class AsyncSensorReader:
             distance_cm,
             weight_kg,
         )
-
         self._clear_buffers()
         return filename
+
     # -------------------- Save --------------------
     def _save_data(self, log_raw_data, log_force_data, athlete_id: str, distance_cm: float, weight_kg: int):
         os.makedirs("readings", exist_ok=True)
@@ -323,22 +349,14 @@ class AsyncSensorReader:
         today_str = date.today().isoformat()
         athlete_id = (athlete_id or "").strip()
 
-        save_dir = os.path.join(
-            "readings",
-            f"{today_str}_{athlete_id}" if athlete_id else today_str
-        )
+        save_dir = os.path.join("readings", f"{today_str}_{athlete_id}" if athlete_id else today_str)
         os.makedirs(save_dir, exist_ok=True)
 
         timestamp_s = int(time.time())
-
-        # ---- Filename with distance + weight ----
         dist_str = f"{int(distance_cm)}cm"
         weight_str = f"{int(weight_kg)}kg"
 
-        filename = os.path.join(
-            save_dir,
-            f"{timestamp_s}_{dist_str}_{weight_str}_grip_data.csv"
-        )
+        filename = os.path.join(save_dir, f"{timestamp_s}_{dist_str}_{weight_str}_grip_data.csv")
 
         combined = [
             (t_raw, raw, force)
@@ -360,11 +378,3 @@ class AsyncSensorReader:
 
         print(f"[SAVE] Saved {len(combined)} samples to {filename}")
         return filename
-    
-    def _notify_state_change(self):
-        cb = getattr(self, "state_change_cb", None)
-        if cb:
-            try:
-                cb()
-            except Exception:
-                pass

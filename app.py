@@ -1,14 +1,13 @@
 import os
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import queue
 import concurrent.futures
 import asyncio
-from tkinter import filedialog
-from Utils.plot import plot_force_over_time
-
-from Controller.ble_controller import BLELoopThread, BLEManager
 import matplotlib.pyplot as plt
+
+from Utils.plot import plot_force_over_time
+from Controller.ble_controller import BLELoopThread, BLEManager
 
 
 class App(tk.Tk):
@@ -20,29 +19,43 @@ class App(tk.Tk):
         # BLE loop in background thread
         self.ble_thread = BLELoopThread()
         self.ble_manager = BLEManager(self.ble_thread.loop)
-        self.ble_manager.on_state_change = lambda: self.after(0, self._render_list)
+
         # UI state
-        self.devices = []           # list of (address, name) from last scan
+        self.devices = []           # list of (address, name)
         self.addr_to_name = {}      # address -> name
         self.reading_active = False
-
-        # Track last saved filename used in status bar at the end of saving
         self.last_saved_file = None
 
+        # re-render list when any reader state changes
+        self.ble_manager.on_state_change = lambda: self.after(0, self._render_list)
+
         self._build_ui()
-        
+
         # Initial scan
         self.refresh_devices()
 
         # Proper shutdown
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ---------------- UI  ----------------
+    # ---------------- UI ----------------
     def _build_ui(self):
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
 
-        # ---------- Row 1 (devices + refresh/connect/disconnect) ----------
+        # ---- Styles for Start/Stop (enabled vs disabled) ----
+        style = ttk.Style(self)
+        style.configure("Start.Enabled.TButton")
+        style.configure("Start.Disabled.TButton")
+        style.configure("Stop.Enabled.TButton")
+        style.configure("Stop.Disabled.TButton")
+
+        # Make disabled look more disabled across themes (best effort)
+        style.map("Start.Enabled.TButton", foreground=[("disabled", "gray50")])
+        style.map("Start.Disabled.TButton", foreground=[("disabled", "gray50")])
+        style.map("Stop.Enabled.TButton", foreground=[("disabled", "gray50")])
+        style.map("Stop.Disabled.TButton", foreground=[("disabled", "gray50")])
+
+        # ---------- Row 1 ----------
         row1 = ttk.Frame(root)
         row1.pack(fill="x")
 
@@ -54,7 +67,7 @@ class App(tk.Tk):
         ttk.Button(row1, text="Connect", command=self.connect_selected).pack(side="left", padx=6)
         ttk.Button(row1, text="Disconnect", command=self.disconnect_selected).pack(side="left")
 
-        # ---------- Row 2 (athlete + distance + weight) ----------
+        # ---------- Row 2 ----------
         row2 = ttk.Frame(root)
         row2.pack(fill="x", pady=(8, 0))
 
@@ -81,7 +94,7 @@ class App(tk.Tk):
         sb.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=sb.set)
 
-        # ---------- Bottom status + start/stop ----------
+        # ---------- Bottom ----------
         bottom = ttk.Frame(root)
         bottom.pack(fill="x", pady=(12, 0))
 
@@ -107,42 +120,12 @@ class App(tk.Tk):
             state="disabled",
             style="Stop.Disabled.TButton",
         )
-        self.stop_btn.pack(side="left")
-        
-        plot_btn = ttk.Button(
-            btns,
-            text="📈 Plot CSV",
-            command=self.plot_csv_file,
-        )
-        plot_btn.pack(anchor="center", pady=5)
-        
-        # ---- Styles for Start/Stop (enabled vs disabled) ----
-        style = ttk.Style(self)
+        self.stop_btn.pack(side="left", padx=(0, 8))
 
-        # Start button
-        style.configure("Start.Enabled.TButton")
-        style.configure("Start.Disabled.TButton")
+        plot_btn = ttk.Button(btns, text="📈 Plot CSV", command=self.plot_csv_file)
+        plot_btn.pack(side="left")
 
-        # Stop button
-        style.configure("Stop.Enabled.TButton")
-        style.configure("Stop.Disabled.TButton")
-        # Make disabled look more disabled across themes (best effort)
-        style.map(
-            "Start.Enabled.TButton",
-            foreground=[("disabled", "gray50")],
-        )
-        style.map(
-            "Start.Disabled.TButton",
-            foreground=[("disabled", "gray50")],
-        )
-        style.map(
-            "Stop.Enabled.TButton",
-            foreground=[("disabled", "gray50")],
-        )
-        style.map(
-            "Stop.Disabled.TButton",
-            foreground=[("disabled", "gray50")],
-        )
+        # ---------- UI popup queue for async BLE prompts ----------
         self.ui_requests: "queue.Queue[tuple[str, str, concurrent.futures.Future]]" = queue.Queue()
 
         def _process_ui_requests():
@@ -173,18 +156,17 @@ class App(tk.Tk):
             ))
             return await asyncio.wrap_future(fut)
 
-        # Expose callback for BLE layer
-        self.prompt_save_on_disconnect = prompt_save_on_disconnect
-        self.ble_manager.prompt_save_cb = self.prompt_save_on_disconnect
-        
+        # Expose callback for BLE layer (used ONLY on unexpected disconnect)
+        self.ble_manager.prompt_save_cb = prompt_save_on_disconnect
+
     # ---------------- UI HELPERS ----------------
     def set_status(self, text: str):
         self.status_var.set(text)
         self.update_idletasks()
 
     def _get_athlete_id(self) -> str:
-        aid = (self.athlete_var.get() or "").strip()
-        return aid if aid else "UNKNOWN"
+        s = (self.athlete_var.get() or "").strip()
+        return s if s else "UNKNOWN"
 
     def _get_distance_cm(self) -> float:
         s = (self.distance_var.get() or "").strip()
@@ -213,26 +195,26 @@ class App(tk.Tk):
         start_enabled = (len(connected) > 0 and not self.reading_active)
         stop_enabled = self.reading_active
 
-        # Start
         self.start_btn.config(
             state=("normal" if start_enabled else "disabled"),
             style=("Start.Enabled.TButton" if start_enabled else "Start.Disabled.TButton"),
         )
-
-        # Stop
         self.stop_btn.config(
             state=("normal" if stop_enabled else "disabled"),
             style=("Stop.Enabled.TButton" if stop_enabled else "Stop.Disabled.TButton"),
         )
 
     def _render_list(self):
-        """
-        Re-render listbox with live connection state, keeping selection best-effort.
-        """
-        old_selection = set(self.listbox.curselection())
+        # If any device error-disconnected while reading, stop reading UI state.
+        if self.reading_active:
+            for r in self.ble_manager.readers.values():
+                if r and getattr(r, "disconnect_error", False):
+                    self.reading_active = False
+                    break
 
+        old_selection = set(self.listbox.curselection())
         self.listbox.delete(0, tk.END)
-        
+
         for i, (addr, name) in enumerate(self.devices):
             reader = self.ble_manager.readers.get(addr)
 
@@ -277,10 +259,15 @@ class App(tk.Tk):
         self.after(50, lambda: self._poll_future(fut, self._on_scan_result))
 
     def _on_scan_result(self, devices):
-        self.devices = devices
-        self.addr_to_name = {addr: name for addr, name in devices}
+        merged = self._merge_connected_on_top(devices)
+        self.devices = merged
+
+        for addr, name in merged:
+            if name:
+                self.addr_to_name[addr] = name
+
         self._render_list()
-        self.set_status(f"Found {len(devices)} device(s).")
+        self.set_status(f"Found {len(devices)} device(s). Showing {len(merged)} total (connected on top).")
 
     def connect_selected(self):
         addrs = self._get_selected_addresses()
@@ -344,7 +331,6 @@ class App(tk.Tk):
         athlete_id = self._get_athlete_id()
         distance_cm = self._get_distance_cm()
         weight_kg = self._get_weight_kg()
-
         self.last_saved_file = None
 
         self.set_status(
@@ -367,11 +353,9 @@ class App(tk.Tk):
         if not reader or not reader.is_connected:
             return self._start_reading_next(addrs, idx + 1, athlete_id, distance_cm, weight_kg)
 
-        # If your controller supports these args, keep them. If not, remove distance/weight.
         fut = self.ble_thread.submit(
             reader.start_reading(athlete_id=athlete_id, distance_cm=distance_cm, weight_kg=weight_kg, direction=0)
         )
-
         self.after(50, lambda: self._poll_future(
             fut, lambda ok: self._on_start_reading_one(addrs, idx, addr, ok, athlete_id, distance_cm, weight_kg)
         ))
@@ -405,12 +389,10 @@ class App(tk.Tk):
         if idx >= len(addrs):
             self.reading_active = False
             self._update_action_buttons()
-
             if self.last_saved_file:
                 self.set_status(f"Stop done. Last saved: {os.path.basename(self.last_saved_file)}")
             else:
                 self.set_status("Stop done. No file saved.")
-
             return
 
         addr = addrs[idx]
@@ -431,20 +413,16 @@ class App(tk.Tk):
             self.set_status(f"Saved: {os.path.basename(filename)}")
         else:
             self.set_status(f"No data saved for {self.addr_to_name.get(addr, addr)}")
-
         self._stop_reading_next(addrs, idx + 1, athlete_id, distance_cm, weight_kg)
 
     # ---------------- CLOSE ----------------
     def on_close(self):
-        # If reading, try to stop first (best effort)
         try:
             if self.reading_active:
                 athlete_id = self._get_athlete_id()
                 distance_cm = self._get_distance_cm()
                 weight_kg = self._get_weight_kg()
-                connected = self._get_connected_addresses()
-
-                for addr in connected:
+                for addr in self._get_connected_addresses():
                     reader = self.ble_manager.readers.get(addr)
                     if reader:
                         self.ble_thread.submit(
@@ -453,7 +431,6 @@ class App(tk.Tk):
         except Exception:
             pass
 
-        # Disconnect everything
         try:
             fut = self.ble_thread.submit(self.ble_manager.disconnect_all())
             fut.result(timeout=6)
@@ -467,8 +444,8 @@ class App(tk.Tk):
 
         self.destroy()
 
+    # ---------------- Plot helper ----------------
     def plot_csv_file(self):
-        # Default to readings folder if it exists
         initial_dir = os.path.abspath("readings")
         if not os.path.isdir(initial_dir):
             initial_dir = os.getcwd()
@@ -479,14 +456,30 @@ class App(tk.Tk):
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
         )
         if not path:
-            return  # user canceled
+            return
 
         try:
-            # relative_time=True is usually nicer to look at
             plt.close("all")
             plot_force_over_time(path, relative_time=True)
         except Exception as e:
             messagebox.showerror("Plot Error", str(e))
+
+    # ---------------- Scan merge helpers ----------------
+    def _get_connected_device_tuples(self):
+        out = []
+        for addr, reader in self.ble_manager.readers.items():
+            if reader and getattr(reader, "is_connected", False):
+                name = self.addr_to_name.get(addr) or getattr(reader, "name", None) or addr
+                out.append((addr, name))
+        out.sort(key=lambda x: (x[1] or "").lower())
+        return out
+
+    def _merge_connected_on_top(self, scanned_devices):
+        connected = self._get_connected_device_tuples()
+        connected_addrs = {a for a, _ in connected}
+        rest = [(a, n) for (a, n) in scanned_devices if a not in connected_addrs]
+        return connected + rest
+
 
 if __name__ == "__main__":
     App().mainloop()

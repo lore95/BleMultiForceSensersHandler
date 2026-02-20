@@ -27,13 +27,19 @@ class BLELoopThread:
     def stop(self):
         self.loop.call_soon_threadsafe(self.loop.stop)
 
+
 class BLEManager:
+    def __init__(self, ble_loop: asyncio.AbstractEventLoop):
+        self.ble_loop = ble_loop
+        self.readers: Dict[str, AsyncSensorReader] = {}
+        self.on_state_change: Optional[Callable[[], None]] = None
+
+        # UI will set this: async prompt(addr, name)->bool
+        self.prompt_save_cb: Optional[Callable[[str, Optional[str]], Awaitable[bool]]] = None
+
     async def scan_force_devices(self, name_contains: str = "force", timeout: float = 6.0) -> List[Tuple[str, str]]:
-        """
-        Returns list of (address, name) for devices whose name contains name_contains (case-insensitive).
-        """
         devices = await BleakScanner.discover(timeout=timeout)
-        out = []
+        out: List[Tuple[str, str]] = []
         needle = (name_contains or "").lower()
         for d in devices:
             name = d.name or ""
@@ -42,22 +48,18 @@ class BLEManager:
         out.sort(key=lambda x: x[1].lower())
         return out
 
-    def __init__(self, ble_loop: asyncio.AbstractEventLoop):
-        self.ble_loop = ble_loop
-        self.readers: Dict[str, AsyncSensorReader] = {}  # key: address
-        self.on_state_change: Optional[Callable[[], None]] = None
-        self.prompt_save_cb: Optional[Callable[[str, Optional[str]], Awaitable[bool]]] = None
-
     async def connect(self, address: str, *, tx_uuid: str = TX_UUID_DEFAULT) -> bool:
         if address in self.readers and self.readers[address].is_connected:
             return True
 
         reader = self.readers.get(address)
         if reader is None:
-            async def _reader_prompt():
+            async def _reader_prompt(addr: str, name: Optional[str]):
+                # This prompt is called ONLY by AsyncSensorReader on unexpected disconnect
                 if self.prompt_save_cb:
-                    return await self.prompt_save_cb(address, None)
+                    return await self.prompt_save_cb(addr, name)
                 return True
+
             reader = AsyncSensorReader(
                 ble_address=address,
                 tx_uuid=tx_uuid,
@@ -65,56 +67,17 @@ class BLEManager:
                 prompt_save_cb=_reader_prompt,
             )
             self.readers[address] = reader
+
+            # UI redraw hook
             reader.state_change_cb = lambda: (self.on_state_change() if self.on_state_change else None)
-        reader.disconnected_callback = self._make_disconnected_cb(address)
 
-        # connect
         return await reader.connect_device()
-
-    def _make_disconnected_cb(self, addr: str):
-        def _on_disconnect(_client):
-            asyncio.create_task(self._handle_unexpected_disconnect(addr))
-        return _on_disconnect
-
-    async def _handle_unexpected_disconnect(self, addr: str):
-        reader = self.readers.get(addr)
-        if not reader:
-            return
-        try:
-            reader.is_connected = False
-        except Exception:
-            pass
-        if not getattr(reader, "is_reading", False):
-            return
-
-        # Ask user whether to save/stop
-        if not self.prompt_save_cb:
-            return
-        name = getattr(reader, "name", None)
-
-        try:
-            want_save = await self.prompt_save_cb(addr, name)
-        except Exception:
-            want_save = False
-
-        if not want_save:
-            return
-
-        try:
-            if hasattr(reader, "stop_reading"):
-                await reader.stop_reading(...)
-            elif hasattr(reader, "save_collected_data"):
-                await reader.save_collected_data()
-        except Exception:
-            print(Exception)
-            pass
 
     async def disconnect(self, address: str) -> bool:
         reader = self.readers.get(address)
         if not reader:
             return True
-        ok = await reader.disconnect_device()
-        return ok
+        return await reader.disconnect_device()
 
     async def disconnect_all(self):
         for addr in list(self.readers.keys()):
@@ -122,4 +85,3 @@ class BLEManager:
                 await self.disconnect(addr)
             except Exception:
                 pass
-    
